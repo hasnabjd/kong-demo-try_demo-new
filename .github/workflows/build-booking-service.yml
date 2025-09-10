@@ -1,0 +1,147 @@
+name: Build kong-demo-try_demo-new booking-service API - Generate Kong Configs
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'booking-service/openapi.yaml'
+      - 'booking-service/kong/**'
+      - 'kong/plugins/**'
+      - 'kong/consumers/**'
+      - '.github/workflows/**'
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+    paths:
+      - 'booking-service/openapi.yaml'
+      - 'booking-service/kong/**'
+      - 'kong/plugins/**'
+      - 'kong/consumers/**'
+
+jobs:
+  oas-to-kong:
+    name: Convert OAS to Kong configurations
+    runs-on: ubuntu-latest
+    # Run on: 1) Initial creation (push to main), 2) PR merged, 3) Manual dispatch
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup deck
+        uses: kong/setup-deck@v1
+        with:
+          deck-version: '1.40.3'
+          wrapper: false
+
+      - name: Generate Kong Declarative Configs from OpenAPI
+        run: |
+          deck file openapi2kong \
+            --spec booking-service/openapi.yaml \
+            --output-file booking-service/kong/.generated/kong.yaml
+
+      - name: Merge all plugins
+        run: |
+          deck file merge booking-service/kong/.generated/kong.yaml \
+            kong/plugins/*.yaml \
+            booking-service/kong/plugins/*.yaml \
+            --output-file booking-service/kong/.generated/kong.yaml
+
+      - name: Merge consumers
+        run: |
+          deck file merge booking-service/kong/.generated/kong.yaml \
+            kong/consumers/*.yaml \
+            --output-file booking-service/kong/.generated/kong.yaml
+
+      - name: Add tags
+        run: |
+          cat booking-service/kong/.generated/kong.yaml | \
+          deck file add-tags booking-service \
+          --selector "$.services[*]" \
+          --selector "$.services[*].routes[*]"  \
+          --selector "$.plugins[*]" \
+          --selector "$.consumers[*]" \
+          --output-file booking-service/kong/.generated/kong.yaml
+
+      - name: Apply optional patches
+        run: |
+          if [ -f "booking-service/kong/patches.yaml" ]; then
+            cat booking-service/kong/.generated/kong.yaml | \
+            deck file patch booking-service/kong/patches.yaml \
+            --output-file booking-service/kong/.generated/kong.yaml
+          else
+            echo "No patches.yaml found, skipping patch step"
+          fi
+
+      - name: Validate Kong config
+        run: |
+          deck file validate booking-service/kong/.generated/kong.yaml
+          echo "Validation passed"
+
+
+      - name: Copy artifact
+        run: |
+          mkdir -p .github/artifacts/booking-service/
+          cp booking-service/kong/.generated/kong.yaml \
+            .github/artifacts/booking-service/booking-service-kong.yaml
+          echo "Artifact copied"
+
+      - name: Deck diff for Konnect
+        id: deck-diff
+        run: |
+          deck gateway diff \
+            --select-tag booking-service \
+            --konnect-control-plane-name ${{vars.KONNECT_INTERNAL_CP}} \
+            --konnect-token ${{ secrets.KONNECT_PAT }} \
+            --konnect-addr ${{vars.KONNECT_ADDR}} \
+            .github/artifacts/booking-service/booking-service-kong.yaml || true
+          echo "Deck diff generated"
+
+
+      #an artifact file will be committed only if it the Kong config differs from the previous one.
+      - name: Check status of any files to be committed
+        run: git status
+
+      - name: Create PR to stage changes for the Kong Gateway in production
+        uses: peter-evans/create-pull-request@v5
+        with:
+          title: "❗PRD❗: Staged changes for Kong Gateway PRD deployment - demo_try_demo-new booking-service"
+          labels: "PRD,booking-service"
+          body: "Staged changes for deploying demo_try_demo-new booking-service to PRD. Review the deck diff in the workflow logs."
+
+      - name: Build completion summary
+        if: always()
+        run: |
+          echo "## Kong Demo Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "🚀 **Demo: try_demo-new** - Service: **booking-service**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ **Build Status**: SUCCESS" >> $GITHUB_STEP_SUMMARY
+            echo "🎯 Kong configurations have been successfully generated and validated" >> $GITHUB_STEP_SUMMARY
+            echo "📦 All deck merges completed with latest updates:" >> $GITHUB_STEP_SUMMARY
+            echo "   - OpenAPI specs merged" >> $GITHUB_STEP_SUMMARY
+            echo "   - Plugin configurations merged" >> $GITHUB_STEP_SUMMARY
+            echo "   - Consumer configurations merged" >> $GITHUB_STEP_SUMMARY
+            echo "   - Tags applied and config validated" >> $GITHUB_STEP_SUMMARY
+            echo "📋 PR for production deployment has been created" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Build Status**: FAILED" >> $GITHUB_STEP_SUMMARY
+            echo "💥 Kong configuration build encountered errors" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event_name }}" == "push" ]; then
+            echo "**🚀 Initial Demo Creation**: First build after demo generation" >> $GITHUB_STEP_SUMMARY
+            echo "**Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "**Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "**✅ PR Approved & Merged**: #${{ github.event.pull_request.number }} - ${{ github.event.pull_request.title }}" >> $GITHUB_STEP_SUMMARY
+            echo "**Merged by**: @${{ github.event.pull_request.merged_by.login }}" >> $GITHUB_STEP_SUMMARY
+            echo "**🔄 Auto-rebuild triggered**: All configurations updated with latest changes" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "**🔧 Manual Trigger**: Manually initiated workflow" >> $GITHUB_STEP_SUMMARY
+            echo "**Triggered by**: @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          fi
